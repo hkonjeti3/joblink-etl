@@ -8,105 +8,127 @@ This document explains the moving parts: triggers, queues, parsers, renderer, LL
 
 ```mermaid
 flowchart TD
-  U[Paste link in Sheet] -->|onEdit| Q[Queue]
-  Q --> P[processNextBatch()]
-  P --> F[fetchSmartFree_(url)]
-  F -->|ATS API| A[Greenhouse/Lever JSON]
-  F -->|Direct HTML| H[HTML signals]
-  F -->|JS-heavy| R[Playwright Renderer (Cloud Run)]
-  H --> D[decideCompanyRole_()]
-  A --> D
-  R --> D
-  D --> W[Write Company/Role/Canonical]
-  D --> S1[append Source: parse{...}]
-  W --> NQ[NotesQueue]
-  NQ --> N[processNotesBatch()]
-  N --> SN[Build snippet (H1/OG/Title + preview) + Profile]
-  SN -->|LLM JSON| L[Notes LLM (optional)]
-  SN -->|Fallback| T[Template]
-  L --> WN[Write LI Invite/Follow-up]
-  T --> WN
-  WN --> S2[append Source: notes{mode=llm|template}]
+  subgraph Sheets
+    U([Paste link in Sheet])
+    Q[[Queue]]
+    NQ[[NotesQueue]]
+  end
+
+  U -->|onEditHandler| Q
+  Q -->|processNextBatch| P[Parse row]
+
+  P --> F{Fetch strategy}
+  F -->|ATS API| A1[Greenhouse / Lever JSON]
+  F -->|Direct HTML| A2[HTML (meta + body)]
+  F -->|Renderer| A3[Playwright (Cloud Run)]
+
+  A1 --> X[decideCompanyRole()]
+  A2 --> X
+  A3 --> X
+
+  X --> W[Write Company / Role / Canonical]
+  W --> NQ
+
+  NQ -->|processNotesBatch| G[Generate Notes]
+  G --> W2[Write LI Invite / Follow-up]
+```
+> Non-destructive by design: only target columns are written; the **Source** column captures how results were produced.
+
+---
+
+## Parsing decision tree
+
+```mermaid
+flowchart TD
+  start([finalUrl, html]) --> json
+
+  json{{JSON-LD JobPosting present?}} -->|yes| set1[Set company & role from JSON-LD\nconf += 1.0]
+  json -->|no| slug
+
+  slug{{ATS slug in URL?}} -->|yes| setC[Company from ATS slug\nconf += 0.35]
+  slug -->|no| h1
+
+  h1{{H1 / OG:title / <title> present?}} -->|yes| setR[Role from H1/OG/Title\nconf += 0.35/0.25/0.15]
+  h1 -->|no| site
+
+  site{{og:site_name and not aggregator?}} -->|yes| setS[Company from site name\nconf += 0.25]
+  site -->|no| split
+
+  split{{Title looks like 'Company – Role'?}} -->|yes| fix[Split into company & role\nconf = max(conf, 0.55)]
+  split --> llm
+  set1 --> llm
+  setC --> llm
+  setR --> llm
+  setS --> llm
+  fix --> llm
+
+  llm{{Missing or generic role/company?}} -->|yes| setLLM[LLM fills gaps (guardrails)]
+  llm -->|no| end([Return fields + decision notes])
+  setLLM --> end
+```
+
+**Notes**
+- *Aggregator awareness:* `og:site_name` is ignored on known aggregators.
+- *Role cleaner:* removes company echoes, req IDs, location suffixes, and emojis.
+- *Confidence clamp:* if company or role is still empty, confidence ≤ 0.5.
+
+---
+
+## Queues & idempotency
+
+```mermaid
+flowchart TD
+  L[Link column edit] --> ENQ[Enqueue (Queue)]
+  ENQ --> BATCH[processNextBatch]
+  BATCH --> PARSE[Fetch + Decide + Write]
+  PARSE --> NENQ[Enqueue (NotesQueue) if notes empty]
+  NENQ --> NBATCH[processNotesBatch]
+  NBATCH --> NOTES[LLM or template -> write notes]
+  NOTES --> CLEAN[Delete processed rows from queues]
+```
+- Queue rows are unique per `(sheet_name, row_index)`.
+- Status cells are updated, but the **Source** column carries the readable audit trail.
+
+---
+
+## Renderer
+
+- A minimal **Playwright** service runs on **Google Cloud Run**.
+- Apps Script calls it *only when* a page looks thin (no JSON-LD/H1/OG) or is JS-heavy.
+- The service returns `{ status, finalUrl, html }`; no cookies or auth persisted.
+
+---
+
+## LLM usage (two places)
+
+1) **Extraction (optional, last resort)** — If role is missing/too generic or company is unknown, we send a compact snippet
+
+   *(H1/OG/Title + short body preview)* to an extractor model. Any inferred fields are clearly tagged.
+
+2) **Notes** — We combine your **Profile** sheet (headline, skills, “one-line hook”) with the job snippet to generate two strings:
+
+   **LI Invite** (≤280 chars) and **LI Follow‑up** (280–500 chars). If the LLM is throttled or returns nothing, a curated **template** is used.
+
+Both paths record provenance in **Source** (`extract:{mode=llm}` and `notes:{mode=llm|template}`).
+
+---
+
+## Provenance examples
+
+```
+parse:{provider=gh-api, signals=jsonld-org+h1, conf=0.90}
+extract:{mode=llm}
+notes:{mode=template}
 ```
 
 ---
 
-## Components
+## Why this shape
 
-### 1) Triggers & Queues
-- **`onEditHandler`**: fires when a user edits the sheet; if the `Link` column changed, enqueue `(sheet,row,url)` into **`Queue`** (idempotent).
-- **`processNextBatch`**: drains **`Queue`**, fetches page(s), extracts fields, writes outputs, and enqueues **`NotesQueue`** if notes are needed.
-- **`processNotesBatch`**: drains **`NotesQueue`**, builds a snippet + Profile, calls the **Notes LLM** (or template), writes messages.
+- **Deterministic-first** keeps results stable and auditable.
 
-**Idempotency**:  
-- A row won’t be re-enqueued if it’s already `queued/processing`.  
-- Notes won’t re-enqueue if both note columns are already filled.
+- **Renderer on-demand** saves cost and avoids brittle scraping.
 
-### 2) Fetch strategy (`fetchSmartFree_`)
-1. **ATS APIs** (Greenhouse/Lever) → authoritative, zero-render cost.  
-2. **Direct fetch** → if HTML contains useful signals (JSON-LD; good H1/OG/Title).  
-3. **Renderer (Cloud Run, Playwright)** → only when HTML looks thin/JS-heavy.  
-4. **Aggregator unwrap** → follow the first ATS link found and refetch once.
+- **Non-destructive writes** let you override anything by hand.
 
-### 3) Extraction (`decideCompanyRole_`)
-- Prefer **JSON-LD** (`JobPosting.hiringOrganization.name`, `title`).
-- Else **H1 → OG:title → <title>** (with a conservative cleaner to strip emojis/IDs/locations and remove company prefixes).
-- If **company/role** are empty or look generic, and `USE_EXTRACT_LLM=1`, call the **Extraction LLM** with a small signal bundle. Any improvement is accepted and marked with `extract:{mode=llm}`.
-
-### 4) Notes generation
-- Build a **snippet** (H1/OG/Title + short body preview) + **Profile** sheet inputs.  
-- Call the **Notes LLM** to return strict JSON:
-  ```json
-  { "invite": "...", "followup": "...", "meta": "llm" }
-  ```
-- If LLM is rate-limited or uncertain, use a **template fallback**.  
-- Write **LI Invite** and **LI Follow-up**, and append `notes:{mode=llm|template}` to **Source**.
-
-### 5) Provenance (Source)
-- Human-readable tokens appended/updated in the **Source** column:
-  - `parse:{provider=gh-api|direct|renderer[-unwrapped], signals=..., conf=0.85}`
-  - `extract:{mode=llm, err=?}` if the rescue LLM was attempted
-  - `notes:{mode=llm|template}` for outreach generation mode
-- Non-destructive: never overwrites your manual edits to fields; only appends/updates tokens.
-
----
-
-## Design choices
-
-- **Deterministic before generative**: Prefer structured truth (APIs/JSON-LD) to avoid hallucination and keep results stable.
-- **Renderer on demand**: Playwright only runs for JS-heavy pages, minimizing cost/latency.
-- **LLM with tight IO**: Small, structured prompts; strict JSON outputs; **template fallback** ensures forward progress.
-- **Queues + throttles**: `BATCH_SIZE`, `REQUESTS_PER_MINUTE`, `NOTES_*` keep the pipeline smooth under quotas.
-- **Auditable by default**: The **Source** column acts as a paper trail for debugging and trust.
-
----
-
-## Error handling & recovery
-
-- **Network/renderer errors**: The row is marked `error` in **Status** with a short message; re-pasting or using the menu action re-queues safely.
-- **LLM errors**: Logged in `NotesQueue.last_error`; notes fall back to template.
-- **Conf=0**: The pipeline auto-escalates (renderer → extraction LLM if enabled).
-
----
-
-## Security & privacy
-
-- Secrets live in **Script Properties** (not in the sheet).  
-- Only short **snippets** are sent to the LLM (not entire pages).  
-- The renderer should validate a shared `x-renderer-key`.
-
----
-
-## Extensibility
-
-- Add more ATS patterns in `guessCompanyFromUrl_` or more signals in `decideCompanyRole_`.
-- Add more note types (e.g., email subject/body) by extending the Notes LLM prompt.
-- Swap LLM providers by changing `LLM_ENDPOINT` and `LLM_MODEL`.
-
----
-
-## Operational knobs
-
-- **Throughput**: `BATCH_SIZE`, `REQUESTS_PER_MINUTE`, `NOTES_BATCH_SIZE`, `NOTES_PER_MINUTE`
-- **Confidence behavior**: tweak heuristics in `decideCompanyRole_`
-- **Renderer budget**: keep it as an escalation to control cost
+- **Readable Source** means you can trust and verify every row.

@@ -1,6 +1,6 @@
 # joblink-etl
 
-**Paste a job link → your Google Sheet auto-fills _Company_, _Role_, _Canonical URL_, and two LinkedIn messages (invite + follow-up).**  
+**Paste a job link → your Google Sheet auto-fills _Company_, _Role_, and two LinkedIn messages (invite + follow-up).**  
 Deterministic parsers first (ATS APIs, JSON-LD, H1/OG/Title), an optional LLM only when needed, and a tiny Playwright renderer on **Google Cloud Run** for JS-heavy pages. Every step leaves a human-readable trail in **Source**.
 
 ---
@@ -26,7 +26,7 @@ You spend time on interviews and follow-ups, not data entry.
   - **LI Follow-up** (280–500 chars) — message to send after they accept
 - **Source** column for **provenance**: `parse:{provider=..., signals=..., conf=...} | extract:{mode=llm?} | notes:{mode=llm|template}`
 - **Queues + idempotency**: safe to paste repeatedly; processed rows won’t re-enqueue.
-- **Duplicate guard**: optional conditional formatting based on Company + Role + Canonical URL.
+- **Duplicate guard**: optional conditional formatting based on Company + Role.
 
 ---
 
@@ -47,20 +47,3 @@ You spend time on interviews and follow-ups, not data entry.
 ## Who it’s for
 
 - **Active job seekers** who want clean tracking + scalable, respectful outreach  
-- **Bootcamps/coaches** standardizing student pipelines  
-- **Small recruiting teams** consolidating disparate links into a single, auditable tracker
-
----
-
-## Outcomes
-
-- **Single source of truth**: clean Company/Role + Canonical URL
-- **Consistent outreach** that respects character limits
-- **Fast iteration**: automate the mundane, focus on velocity and fit
-- **Interoperable**: everything lives in Sheets (exports, Apps Script, no-code tools)
-
----
-
-## License
-
-MIT — see `/LICENSE`.
