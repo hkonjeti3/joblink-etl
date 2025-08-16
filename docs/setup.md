@@ -137,4 +137,4 @@ Assumes: B=Canonical Link, C=Company (auto), D=Role (auto).
 
 ## Next steps
 
-- Learn how it works under the hood: **[architecture.md](architecture.md)**.
+- Learn how it works under the hood: **[Architecture & Design](./architecture.md)**.
